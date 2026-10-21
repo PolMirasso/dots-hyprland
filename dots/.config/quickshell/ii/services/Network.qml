@@ -69,9 +69,38 @@ Singleton {
         rescanProcess.running = true;
     }
 
+    // Bash function printing the UUID of a saved profile for $SSID. Matches the SSID rather than the
+    // profile name, which can differ (installer-made profiles, nmcli's "SSID 1" duplicates)
+    readonly property string findWifiProfileScript: `
+        find_profile() {
+            nmcli -t -f UUID,TYPE connection show | while IFS=: read -r uuid type; do
+                [ "$type" = "802-11-wireless" ] || continue
+                if [ "$(nmcli --escape no -g 802-11-wireless.ssid connection show uuid "$uuid")" = "$SSID" ]; then
+                    echo "$uuid"
+                    break
+                fi
+            done
+        }
+    `
+
     function connectToWifiNetwork(accessPoint: WifiAccessPoint): void {
         accessPoint.askingPassword = false;
         root.wifiConnectTarget = accessPoint;
+        if (accessPoint.isEnterprise) {
+            // `nmcli dev wifi connect` can't create 802.1X profiles, so only bring up an existing one.
+            // If there's none, the command fails and we ask for credentials.
+            // Wrong 802.1X credentials otherwise keep nmcli waiting for the default 90s.
+            // exec so that stopping a superseded attempt stops nmcli itself
+            startConnectProc(accessPoint, ["bash", "-c", root.findWifiProfileScript + `
+                SSID="$1"
+                uuid=$(find_profile)
+                [ -n "$uuid" ] || exit 1
+                # Certificate-based (EAP-TLS) profiles have no username/password to ask for
+                [ "$(nmcli -g 802-1x.eap connection show uuid "$uuid")" = "tls" ] && echo "eap-tls"
+                exec nmcli --wait 30 connection up uuid "$uuid"
+            `, "bash", accessPoint.ssid])
+            return;
+        }
         // We use this instead of `nmcli connection up SSID` because this also creates a connection profile
         startConnectProc(accessPoint, ["nmcli", "dev", "wifi", "connect", accessPoint.ssid])
 
@@ -98,10 +127,35 @@ Singleton {
     }
 
     function changePassword(network: WifiAccessPoint, password: string, username = ""): void {
-        // TODO: enterprise wifi with username
         network.askingPassword = false;
         root.wifiConnectTarget = network;
         changePasswordProc.network = network;
+        if (network.isEnterprise) {
+            // Reuse an existing profile (keeping e.g. its CA validation from a provisioning tool), otherwise
+            // create one. PEAP and TTLS with MSCHAPv2 cover most networks; the server picks the method.
+            // Created profiles don't validate the server certificate.
+            // Without a username there's nothing to create, so the retry just asks again
+            changePasswordProc.exec({
+                "environment": {
+                    "IDENTITY": username,
+                    "PASSWORD": password,
+                    "SSID": network.ssid
+                },
+                "command": ["bash", "-c", root.findWifiProfileScript + `
+                    uuid=$(find_profile)
+                    if [ -n "$uuid" ]; then
+                        args=(802-1x.password "$PASSWORD" 802-1x.password-flags 0)
+                        [ -n "$IDENTITY" ] && args+=(802-1x.identity "$IDENTITY")
+                        nmcli connection modify uuid "$uuid" "\${args[@]}"
+                    elif [ -n "$IDENTITY" ]; then
+                        nmcli connection add type wifi con-name "$SSID" ssid "$SSID" \\
+                            wifi-sec.key-mgmt wpa-eap 802-1x.eap peap,ttls 802-1x.phase2-auth mschapv2 \\
+                            802-1x.identity "$IDENTITY" 802-1x.password "$PASSWORD" 802-1x.password-flags 0
+                    fi
+                `]
+            })
+            return;
+        }
         changePasswordProc.exec({
             "environment": {
                 "PASSWORD": password,
@@ -122,6 +176,7 @@ Singleton {
             id: connectProc
             required property WifiAccessPoint target
             readonly property bool current: root.currentConnectProc === connectProc
+            property bool askForCredentials: true
             environment: ({
                 LANG: "C",
                 LC_ALL: "C"
@@ -129,13 +184,14 @@ Singleton {
             stdout: SplitParser {
                 onRead: line => {
                     // print(line)
+                    if (line === "eap-tls") connectProc.askForCredentials = false
                     getNetworks.running = true
                 }
             }
             stderr: SplitParser {
                 onRead: line => {
                     // print("err:", line)
-                    if (connectProc.current && line.includes("Secrets were required")) {
+                    if (connectProc.current && connectProc.askForCredentials && line.includes("Secrets were required")) {
                         connectProc.target.askingPassword = true
                     }
                 }
@@ -143,7 +199,7 @@ Singleton {
             onExited: (exitCode, exitStatus) => {
                 // Superseded attempts must not touch the state of the newer one
                 if (connectProc.current) {
-                    connectProc.target.askingPassword = (exitCode !== 0)
+                    connectProc.target.askingPassword = (exitCode !== 0 && connectProc.askForCredentials)
                     root.wifiConnectTarget = null
                     root.currentConnectProc = null
                 }
