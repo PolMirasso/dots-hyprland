@@ -55,6 +55,10 @@ DialogListItem {
             Layout.topMargin: 8
             visible: root.wifiNetwork?.askingPassword ?? false
 
+            function submit() {
+                Network.changePassword(root.wifiNetwork, passwordField.text, usernameField.text, domainField.text.trim());
+            }
+
             MaterialTextField {
                 id: usernameField
                 Layout.fillWidth: true
@@ -74,9 +78,18 @@ DialogListItem {
                 echoMode: TextInput.Password
                 inputMethodHints: Qt.ImhSensitiveData
 
-                onAccepted: {
-                    Network.changePassword(root.wifiNetwork, passwordField.text, usernameField.text);
-                }
+                onAccepted: passwordPrompt.submit()
+            }
+
+            MaterialTextField {
+                id: domainField
+                Layout.fillWidth: true
+                visible: root.wifiNetwork?.isEnterprise ?? false
+                text: root.wifiNetwork?.savedDomain ?? ""
+                placeholderText: Translation.tr("Server domain (optional)")
+                inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText | Qt.ImhUrlCharactersOnly
+
+                onAccepted: passwordPrompt.submit()
             }
 
             RowLayout {
@@ -95,9 +108,7 @@ DialogListItem {
 
                 DialogButton {
                     buttonText: Translation.tr("Connect")
-                    onClicked: {
-                        Network.changePassword(root.wifiNetwork, passwordField.text, usernameField.text);
-                    }
+                    onClicked: passwordPrompt.submit()
                 }
             }
         }

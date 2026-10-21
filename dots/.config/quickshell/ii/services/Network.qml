@@ -126,31 +126,43 @@ Singleton {
         Quickshell.execDetached(["xdg-open", "https://nmcheck.gnome.org/"]) // From some StackExchange thread, seems to work
     }
 
-    function changePassword(network: WifiAccessPoint, password: string, username = ""): void {
+    function changePassword(network: WifiAccessPoint, password: string, username = "", domain = ""): void {
         network.askingPassword = false;
         root.wifiConnectTarget = network;
         changePasswordProc.network = network;
         if (network.isEnterprise) {
             // Reuse an existing profile (keeping e.g. its CA validation from a provisioning tool), otherwise
             // create one. PEAP and TTLS with MSCHAPv2 cover most networks; the server picks the method.
-            // Created profiles don't validate the server certificate.
+            // With a domain, the server certificate must chain to a system CA and match it; without one,
+            // created profiles don't validate the server. Validation is only changed when the domain differs
+            // from the saved one, so clearing it turns the system CA check off and leaving it as is keeps
+            // an existing profile's settings.
             // Without a username there's nothing to create, so the retry just asks again
             changePasswordProc.exec({
                 "environment": {
                     "IDENTITY": username,
                     "PASSWORD": password,
+                    "DOMAIN": domain,
+                    "SAVED_DOMAIN": network.savedDomain,
                     "SSID": network.ssid
                 },
                 "command": ["bash", "-c", root.findWifiProfileScript + `
+                    args=(802-1x.password "$PASSWORD" 802-1x.password-flags 0)
+                    if [ "$DOMAIN" != "$SAVED_DOMAIN" ]; then
+                        if [ -n "$DOMAIN" ]; then
+                            args+=(802-1x.system-ca-certs yes 802-1x.domain-suffix-match "$DOMAIN")
+                        else
+                            args+=(802-1x.system-ca-certs no 802-1x.domain-suffix-match "")
+                        fi
+                    fi
                     uuid=$(find_profile)
                     if [ -n "$uuid" ]; then
-                        args=(802-1x.password "$PASSWORD" 802-1x.password-flags 0)
                         [ -n "$IDENTITY" ] && args+=(802-1x.identity "$IDENTITY")
                         nmcli connection modify uuid "$uuid" "\${args[@]}"
                     elif [ -n "$IDENTITY" ]; then
                         nmcli connection add type wifi con-name "$SSID" ssid "$SSID" \\
                             wifi-sec.key-mgmt wpa-eap 802-1x.eap peap,ttls 802-1x.phase2-auth mschapv2 \\
-                            802-1x.identity "$IDENTITY" 802-1x.password "$PASSWORD" 802-1x.password-flags 0
+                            802-1x.identity "$IDENTITY" "\${args[@]}"
                     fi
                 `]
             })
@@ -165,8 +177,36 @@ Singleton {
         })
     }
 
+    function askForPassword(accessPoint: WifiAccessPoint): void {
+        // Show the domain the saved profile validates against, so it can be corrected or cleared
+        if (!accessPoint.askingPassword && accessPoint.isEnterprise) {
+            accessPoint.savedDomain = "";
+            savedDomainProc.target = accessPoint;
+            savedDomainProc.exec({
+                "environment": {
+                    "SSID": accessPoint.ssid
+                },
+                "command": ["bash", "-c", root.findWifiProfileScript + `
+                    uuid=$(find_profile)
+                    [ -n "$uuid" ] && nmcli --escape no -g 802-1x.domain-suffix-match connection show uuid "$uuid"
+                `]
+            })
+        }
+        accessPoint.askingPassword = true;
+    }
+
     Process {
         id: enableWifiProc
+    }
+
+    Process {
+        id: savedDomainProc
+        property WifiAccessPoint target
+        stdout: StdioCollector {
+            onStreamFinished: {
+                if (savedDomainProc.target) savedDomainProc.target.savedDomain = text.trim();
+            }
+        }
     }
 
     Component {
@@ -192,14 +232,15 @@ Singleton {
                 onRead: line => {
                     // print("err:", line)
                     if (connectProc.current && connectProc.askForCredentials && line.includes("Secrets were required")) {
-                        connectProc.target.askingPassword = true
+                        root.askForPassword(connectProc.target)
                     }
                 }
             }
             onExited: (exitCode, exitStatus) => {
                 // Superseded attempts must not touch the state of the newer one
                 if (connectProc.current) {
-                    connectProc.target.askingPassword = (exitCode !== 0 && connectProc.askForCredentials)
+                    if (exitCode !== 0 && connectProc.askForCredentials) root.askForPassword(connectProc.target)
+                    else connectProc.target.askingPassword = false
                     root.wifiConnectTarget = null
                     root.currentConnectProc = null
                 }
