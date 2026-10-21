@@ -231,7 +231,7 @@ Singleton {
             stderr: SplitParser {
                 onRead: line => {
                     // print("err:", line)
-                    if (connectProc.current && connectProc.askForCredentials && line.includes("Secrets were required")) {
+                    if (connectProc.current && connectProc.target && connectProc.askForCredentials && line.includes("Secrets were required")) {
                         root.askForPassword(connectProc.target)
                     }
                 }
@@ -239,8 +239,11 @@ Singleton {
             onExited: (exitCode, exitStatus) => {
                 // Superseded attempts must not touch the state of the newer one
                 if (connectProc.current) {
-                    if (exitCode !== 0 && connectProc.askForCredentials) root.askForPassword(connectProc.target)
-                    else connectProc.target.askingPassword = false
+                    // The target is gone if a rescan regrouped its SSID under another BSSID meanwhile
+                    if (connectProc.target) {
+                        if (exitCode !== 0 && connectProc.askForCredentials) root.askForPassword(connectProc.target)
+                        else connectProc.target.askingPassword = false
+                    }
                     root.wifiConnectTarget = null
                     root.currentConnectProc = null
                 }
