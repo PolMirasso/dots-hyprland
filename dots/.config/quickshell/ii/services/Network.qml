@@ -19,8 +19,9 @@ Singleton {
 
     property bool wifiEnabled: false
     property bool wifiScanning: false
-    property bool wifiConnecting: connectProc.running
+    property bool wifiConnecting: currentConnectProc !== null
     property WifiAccessPoint wifiConnectTarget
+    property var currentConnectProc: null
     readonly property list<WifiAccessPoint> wifiNetworks: []
     readonly property WifiAccessPoint active: wifiNetworks.find(n => n.active) ?? null
     readonly property list<var> friendlyWifiNetworks: [...wifiNetworks].sort((a, b) => {
@@ -72,8 +73,20 @@ Singleton {
         accessPoint.askingPassword = false;
         root.wifiConnectTarget = accessPoint;
         // We use this instead of `nmcli connection up SSID` because this also creates a connection profile
-        connectProc.exec(["nmcli", "dev", "wifi", "connect", accessPoint.ssid])
+        startConnectProc(accessPoint, ["nmcli", "dev", "wifi", "connect", accessPoint.ssid])
 
+    }
+
+    function startConnectProc(accessPoint: WifiAccessPoint, command: list<string>): void {
+        // One process per attempt: a killed nmcli exits normally with code 1, so with a shared
+        // process the old attempt's exit would be taken as the new one failing
+        const previous = root.currentConnectProc;
+        root.currentConnectProc = connectProcComp.createObject(root, {
+            target: accessPoint,
+            command: command
+        });
+        if (previous) previous.running = false;
+        root.currentConnectProc.running = true;
     }
 
     function disconnectWifiNetwork(): void {
@@ -87,6 +100,8 @@ Singleton {
     function changePassword(network: WifiAccessPoint, password: string, username = ""): void {
         // TODO: enterprise wifi with username
         network.askingPassword = false;
+        root.wifiConnectTarget = network;
+        changePasswordProc.network = network;
         changePasswordProc.exec({
             "environment": {
                 "PASSWORD": password,
@@ -100,29 +115,40 @@ Singleton {
         id: enableWifiProc
     }
 
-    Process {
-        id: connectProc
-        environment: ({
-            LANG: "C",
-            LC_ALL: "C"
-        })
-        stdout: SplitParser {
-            onRead: line => {
-                // print(line)
-                getNetworks.running = true
-            }
-        }
-        stderr: SplitParser {
-            onRead: line => {
-                // print("err:", line)
-                if (line.includes("Secrets were required")) {
-                    root.wifiConnectTarget.askingPassword = true
+    Component {
+        id: connectProcComp
+
+        Process {
+            id: connectProc
+            required property WifiAccessPoint target
+            readonly property bool current: root.currentConnectProc === connectProc
+            environment: ({
+                LANG: "C",
+                LC_ALL: "C"
+            })
+            stdout: SplitParser {
+                onRead: line => {
+                    // print(line)
+                    getNetworks.running = true
                 }
             }
-        }
-        onExited: (exitCode, exitStatus) => {
-            root.wifiConnectTarget.askingPassword = (exitCode !== 0)
-            root.wifiConnectTarget = null
+            stderr: SplitParser {
+                onRead: line => {
+                    // print("err:", line)
+                    if (connectProc.current && line.includes("Secrets were required")) {
+                        connectProc.target.askingPassword = true
+                    }
+                }
+            }
+            onExited: (exitCode, exitStatus) => {
+                // Superseded attempts must not touch the state of the newer one
+                if (connectProc.current) {
+                    connectProc.target.askingPassword = (exitCode !== 0)
+                    root.wifiConnectTarget = null
+                    root.currentConnectProc = null
+                }
+                connectProc.destroy()
+            }
         }
     }
 
@@ -135,9 +161,9 @@ Singleton {
 
     Process {
         id: changePasswordProc
+        property WifiAccessPoint network
         onExited: { // Re-attempt connection after changing password
-            connectProc.running = false
-            connectProc.running = true
+            if (network) root.connectToWifiNetwork(network);
         }
     }
 
