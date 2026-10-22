@@ -83,7 +83,37 @@ Singleton {
         }
     `
 
-    function connectToWifiNetwork(accessPoint: WifiAccessPoint): void {
+    // Bash function bringing up profile $1 with $PASSWORD as its secret property $2. A password is never put on
+    // a command line, where any local user can read it: it comes in the environment and is saved through
+    // nmcli's editor on stdin, so that a wrong one fails right away like a wrong saved one. The editor drops
+    // tabs and surrounding spaces though, so such passwords are handed over at activation with passwd-file
+    // instead (which strips unescaped whitespace), where NetworkManager keeps retrying a wrong one until
+    // nmcli gives up. The saved one is cleared first, or it would be retried until nmcli gives up; that
+    // takes toggling the flags, as setting it to "" keeps it
+    readonly property string connectWithPasswordScript: `
+        passwd_file_value() {
+            local v=\${1//\\\\/\\\\\\\\}
+            v=\${v// /\\\\ }
+            printf '%s' "\${v//$'\\t'/\\\\$'\\t'}"
+        }
+        connect_with_password() {
+            case "$PASSWORD" in
+                *$'\\t'* | " "* | *" ")
+                    nmcli connection modify uuid "$1" "$2-flags" 2 && nmcli connection modify uuid "$1" "$2-flags" 0
+                    # nmcli asks for the 802.1X identity along with the password
+                    local identity=
+                    [ "$2" = 802-1x.password ] && identity=$(nmcli --escape no -g 802-1x.identity connection show uuid "$1")
+                    exec nmcli --wait 30 connection up uuid "$1" passwd-file <(
+                        printf '%s:%s\\n' "$2" "$(passwd_file_value "$PASSWORD")"
+                        [ -n "$identity" ] && printf '802-1x.identity:%s\\n' "$(passwd_file_value "$identity")"
+                    ) ;;
+            esac
+            printf 'set %s %s\\nsave persistent\\nquit\\n' "$2" "$PASSWORD" | nmcli connection edit uuid "$1" > /dev/null
+            exec nmcli --wait 30 connection up uuid "$1"
+        }
+    `
+
+    function connectToWifiNetwork(accessPoint: WifiAccessPoint, password = ""): void {
         accessPoint.askingPassword = false;
         root.wifiConnectTarget = accessPoint;
         if (accessPoint.isEnterprise) {
@@ -91,14 +121,25 @@ Singleton {
             // If there's none, the command fails and we ask for credentials.
             // Wrong 802.1X credentials otherwise keep nmcli waiting for the default 90s.
             // exec so that stopping a superseded attempt stops nmcli itself
-            startConnectProc(accessPoint, ["bash", "-c", root.findWifiProfileScript + `
+            startConnectProc(accessPoint, ["bash", "-c", root.findWifiProfileScript + root.connectWithPasswordScript + `
                 SSID="$1"
                 uuid=$(find_profile)
                 [ -n "$uuid" ] || exit 1
                 # Certificate-based (EAP-TLS) profiles have no username/password to ask for
                 [ "$(nmcli -g 802-1x.eap connection show uuid "$uuid")" = "tls" ] && echo "eap-tls"
-                exec nmcli --wait 30 connection up uuid "$uuid"
-            `, "bash", accessPoint.ssid])
+                [ -n "$PASSWORD" ] || exec nmcli --wait 30 connection up uuid "$uuid"
+                connect_with_password "$uuid" 802-1x.password
+            `, "bash", accessPoint.ssid], password)
+            return;
+        }
+        if (password.length > 0) {
+            // Without a profile, `nmcli dev wifi connect` creates one, reading the key from stdin
+            startConnectProc(accessPoint, ["bash", "-c", root.findWifiProfileScript + root.connectWithPasswordScript + `
+                SSID="$1"
+                uuid=$(find_profile)
+                [ -n "$uuid" ] || exec nmcli --wait 30 --ask dev wifi connect "$SSID" <<< "$PASSWORD"
+                connect_with_password "$uuid" 802-11-wireless-security.psk
+            `, "bash", accessPoint.ssid], password)
             return;
         }
         // We use this instead of `nmcli connection up SSID` because this also creates a connection profile
@@ -106,13 +147,14 @@ Singleton {
 
     }
 
-    function startConnectProc(accessPoint: WifiAccessPoint, command: list<string>): void {
+    function startConnectProc(accessPoint: WifiAccessPoint, command: list<string>, password = ""): void {
         // One process per attempt: a killed nmcli exits normally with code 1, so with a shared
         // process the old attempt's exit would be taken as the new one failing
         const previous = root.currentConnectProc;
         root.currentConnectProc = connectProcComp.createObject(root, {
             target: accessPoint,
-            command: command
+            command: command,
+            password: password
         });
         if (previous) previous.running = false;
         root.currentConnectProc.running = true;
@@ -127,53 +169,48 @@ Singleton {
     }
 
     function changePassword(network: WifiAccessPoint, password: string, username = "", domain = ""): void {
+        if (!network.isEnterprise) {
+            root.connectToWifiNetwork(network, password);
+            return;
+        }
         network.askingPassword = false;
         root.wifiConnectTarget = network;
         changePasswordProc.network = network;
-        if (network.isEnterprise) {
-            // Reuse an existing profile (keeping e.g. its CA validation from a provisioning tool), otherwise
-            // create one. PEAP and TTLS with MSCHAPv2 cover most networks; the server picks the method.
-            // With a domain, the server certificate must chain to a system CA and match it; without one,
-            // created profiles don't validate the server. Validation is only changed when the domain differs
-            // from the saved one, so clearing it turns the system CA check off and leaving it as is keeps
-            // an existing profile's settings.
-            // Without a username there's nothing to create, so the retry just asks again
-            changePasswordProc.exec({
-                "environment": {
-                    "IDENTITY": username,
-                    "PASSWORD": password,
-                    "DOMAIN": domain,
-                    "SAVED_DOMAIN": network.savedDomain,
-                    "SSID": network.ssid
-                },
-                "command": ["bash", "-c", root.findWifiProfileScript + `
-                    args=(802-1x.password "$PASSWORD" 802-1x.password-flags 0)
-                    if [ "$DOMAIN" != "$SAVED_DOMAIN" ]; then
-                        if [ -n "$DOMAIN" ]; then
-                            args+=(802-1x.system-ca-certs yes 802-1x.domain-suffix-match "$DOMAIN")
-                        else
-                            args+=(802-1x.system-ca-certs no 802-1x.domain-suffix-match "")
-                        fi
-                    fi
-                    uuid=$(find_profile)
-                    if [ -n "$uuid" ]; then
-                        [ -n "$IDENTITY" ] && args+=(802-1x.identity "$IDENTITY")
-                        nmcli connection modify uuid "$uuid" "\${args[@]}"
-                    elif [ -n "$IDENTITY" ]; then
-                        nmcli connection add type wifi con-name "$SSID" ssid "$SSID" \\
-                            wifi-sec.key-mgmt wpa-eap 802-1x.eap peap,ttls 802-1x.phase2-auth mschapv2 \\
-                            802-1x.identity "$IDENTITY" "\${args[@]}"
-                    fi
-                `]
-            })
-            return;
-        }
+        changePasswordProc.password = password;
+        // Reuse an existing profile (keeping e.g. its CA validation from a provisioning tool), otherwise
+        // create one. PEAP and TTLS with MSCHAPv2 cover most networks; the server picks the method.
+        // With a domain, the server certificate must chain to a system CA and match it; without one,
+        // created profiles don't validate the server. Validation is only changed when the domain differs
+        // from the saved one, so clearing it turns the system CA check off and leaving it as is keeps
+        // an existing profile's settings.
+        // The password itself is set when connecting.
+        // Without a username there's nothing to create, so the retry just asks again
         changePasswordProc.exec({
             "environment": {
-                "PASSWORD": password,
+                "IDENTITY": username,
+                "DOMAIN": domain,
+                "SAVED_DOMAIN": network.savedDomain,
                 "SSID": network.ssid
             },
-            "command": ["bash", "-c", 'nmcli connection modify "$SSID" wifi-sec.psk "$PASSWORD"']
+            "command": ["bash", "-c", root.findWifiProfileScript + `
+                args=(802-1x.password-flags 0)
+                if [ "$DOMAIN" != "$SAVED_DOMAIN" ]; then
+                    if [ -n "$DOMAIN" ]; then
+                        args+=(802-1x.system-ca-certs yes 802-1x.domain-suffix-match "$DOMAIN")
+                    else
+                        args+=(802-1x.system-ca-certs no 802-1x.domain-suffix-match "")
+                    fi
+                fi
+                uuid=$(find_profile)
+                if [ -n "$uuid" ]; then
+                    [ -n "$IDENTITY" ] && args+=(802-1x.identity "$IDENTITY")
+                    nmcli connection modify uuid "$uuid" "\${args[@]}"
+                elif [ -n "$IDENTITY" ]; then
+                    nmcli connection add type wifi con-name "$SSID" ssid "$SSID" \\
+                        wifi-sec.key-mgmt wpa-eap 802-1x.eap peap,ttls 802-1x.phase2-auth mschapv2 \\
+                        802-1x.identity "$IDENTITY" "\${args[@]}"
+                fi
+            `]
         })
     }
 
@@ -217,9 +254,11 @@ Singleton {
             required property WifiAccessPoint target
             readonly property bool current: root.currentConnectProc === connectProc
             property bool askForCredentials: true
+            property string password
             environment: ({
                 LANG: "C",
-                LC_ALL: "C"
+                LC_ALL: "C",
+                PASSWORD: connectProc.password
             })
             stdout: SplitParser {
                 onRead: line => {
@@ -262,8 +301,10 @@ Singleton {
     Process {
         id: changePasswordProc
         property WifiAccessPoint network
-        onExited: { // Re-attempt connection after changing password
-            if (network) root.connectToWifiNetwork(network);
+        property string password
+        onExited: { // Re-attempt connection after updating the profile
+            if (network) root.connectToWifiNetwork(network, password);
+            password = "";
         }
     }
 
