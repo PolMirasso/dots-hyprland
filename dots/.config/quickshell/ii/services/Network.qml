@@ -69,11 +69,12 @@ Singleton {
         rescanProcess.running = true;
     }
 
-    // Bash function printing the UUID of a saved profile for $SSID. Matches the SSID rather than the
-    // profile name, which can differ (installer-made profiles, nmcli's "SSID 1" duplicates)
+    // Bash function printing the UUID of a saved profile for $SSID (`find_profile --active` for an active one).
+    // Matches the SSID rather than the profile name, which can differ (installer-made profiles, nmcli's
+    // "SSID 1" duplicates)
     readonly property string findWifiProfileScript: `
         find_profile() {
-            nmcli -t -f UUID,TYPE connection show | while IFS=: read -r uuid type; do
+            nmcli -t -f UUID,TYPE connection show "$@" | while IFS=: read -r uuid type; do
                 [ "$type" = "802-11-wireless" ] || continue
                 if [ "$(nmcli --escape no -g 802-11-wireless.ssid connection show uuid "$uuid")" = "$SSID" ]; then
                     echo "$uuid"
@@ -161,7 +162,16 @@ Singleton {
     }
 
     function disconnectWifiNetwork(): void {
-        if (active) disconnectProc.exec(["nmcli", "connection", "down", active.ssid]);
+        // By UUID, as the profile name can differ from the SSID
+        if (active) disconnectProc.exec({
+            "environment": {
+                "SSID": active.ssid
+            },
+            "command": ["bash", "-c", root.findWifiProfileScript + `
+                uuid=$(find_profile --active)
+                [ -n "$uuid" ] && nmcli connection down uuid "$uuid"
+            `]
+        });
     }
 
     function openPublicWifiPortal() {
@@ -302,8 +312,8 @@ Singleton {
         id: changePasswordProc
         property WifiAccessPoint network
         property string password
-        onExited: { // Re-attempt connection after updating the profile
-            if (network) root.connectToWifiNetwork(network, password);
+        onExited: { // Re-attempt connection after updating the profile, unless another network was picked meanwhile
+            if (network && root.wifiConnectTarget === network) root.connectToWifiNetwork(network, password);
             password = "";
         }
     }

@@ -59,6 +59,14 @@ DialogListItem {
                 Network.changePassword(root.wifiNetwork, passwordField.text, usernameField.text, domainField.text.trim());
             }
 
+            Connections {
+                target: root.wifiNetwork
+                function onAskingPasswordChanged() {
+                    // Typing breaks the binding, so restore it to show the saved domain on each prompt
+                    if (root.wifiNetwork.askingPassword) domainField.text = Qt.binding(() => root.wifiNetwork?.savedDomain ?? "");
+                }
+            }
+
             MaterialTextField {
                 id: usernameField
                 Layout.fillWidth: true
